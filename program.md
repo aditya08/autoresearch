@@ -1,114 +1,206 @@
-# autoresearch
+# commresearch
 
-This is an experiment to have the LLM do its own research.
+Autonomous research loop for s-step / communication-avoiding methods,
+under a *modeled* α–β–γ communication regime with explicit overlap.
 
 ## Setup
 
-To set up a new experiment, work with the user to:
+To set up a new run, work with the user to:
 
-1. **Agree on a run tag**: propose a tag based on today's date (e.g. `mar5`). The branch `autoresearch/<tag>` must not already exist — this is a fresh run.
-2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current master.
-3. **Read the in-scope files**: The repo is small. Read these files for full context:
-   - `README.md` — repository context.
-   - `prepare.py` — fixed constants, data prep, tokenizer, dataloader, evaluation. Do not modify.
-   - `train.py` — the file you modify. Model architecture, optimizer, training loop.
-4. **Verify data exists**: Check that `~/.cache/autoresearch/` contains data shards and a tokenizer. If not, tell the human to run `uv run prepare.py`.
-5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
-6. **Confirm and go**: Confirm setup looks good.
+1. **Agree on a run tag**: propose a tag based on today's date and topic
+   (e.g. `mar5-localsgd`, `apr2-cheb-ns`). The branch
+   `commresearch/<tag>` must not already exist — fresh runs only.
+2. **Create the branch**: `git checkout -b commresearch/<tag>` from
+   current `main`.
+3. **Read the in-scope files**:
+   - `README.md` — repository context and the pivot from autoresearch.
+   - `CLAUDE.md` — repository guidance.
+   - `prepare.py` — fixed constants, data prep, tokenizer, dataloader,
+     evaluation. **Do not modify.**
+   - `train.py` — the file you modify. Model architecture, optimizer,
+     training loop, comm config block.
+   - `comm_model.py` — α–β–γ model + overlap. You may extend
+     (new collectives, refined overlap), but preserve the existing API.
+   - `strategies.py` — parallel strategy registry. Add new strategies
+     here as new branches in `step_cost`.
+4. **Verify data exists**: Check `~/.cache/autoresearch/` for shards and a
+   tokenizer. If missing, ask the human to run `uv run prepare.py`.
+5. **Initialize results.tsv** with the header below.
+6. **Confirm and go.**
 
-Once you get confirmation, kick off the experimentation.
+Once confirmed, kick off the experimentation.
 
 ## Experimentation
 
-Each experiment runs on a single GPU. The training script runs for a **fixed time budget of 5 minutes** (wall clock training time, excluding startup/compilation). You launch it simply as: `uv run train.py`.
+The training script runs for a **fixed simulated-time budget of 5 minutes**
+(`TIME_BUDGET` in `prepare.py`, reinterpreted as compute + modeled comm).
+Real wall-clock will typically be ≤ 5 minutes; methods with high modeled
+comm finish *faster* in real time because fewer steps fit in the simulated
+budget. A 10-min real-wall-clock kill switch is enforced.
+
+Launch: `uv run train.py > run.log 2>&1`
 
 **What you CAN do:**
-- Modify `train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, training loop, batch size, model size, etc.
+- Modify `train.py`: model, optimizer, training loop, the `COMM` /
+  `OVERLAP` / `STRATEGY` config block at the top.
+- Extend `comm_model.py` and `strategies.py` to add new collectives or
+  parallel strategies. Preserve existing public functions
+  (`allreduce_seconds`, `apply_overlap`, `step_cost`).
 
 **What you CANNOT do:**
-- Modify `prepare.py`. It is read-only. It contains the fixed evaluation, data loading, tokenizer, and training constants (time budget, sequence length, etc).
-- Install new packages or add dependencies. You can only use what's already in `pyproject.toml`.
-- Modify the evaluation harness. The `evaluate_bpb` function in `prepare.py` is the ground truth metric.
+- Modify `prepare.py` or `evaluate_bpb`. Ground-truth metric is fixed.
+- Add or remove dependencies.
+- Change `TIME_BUDGET`. Hold the budget constant so `val_bpb` is comparable.
 
-**The goal is simple: get the lowest val_bpb.** Since the time budget is fixed, you don't need to worry about training time — it's always 5 minutes. Everything is fair game: change the architecture, the optimizer, the hyperparameters, the batch size, the model size. The only constraint is that the code runs without crashing and finishes within the time budget.
+**The goal: lowest `val_bpb` under a *declared* comm regime.**
+You declare `(COMM, OVERLAP, STRATEGY)` and report `val_bpb` for that
+regime. Comparisons are valid within the same declared regime. Cross-regime
+comparisons are a separate study (see "Sensitivity sweep" below).
 
-**VRAM** is a soft constraint. Some increase is acceptable for meaningful val_bpb gains, but it should not blow up dramatically.
+**Simplicity criterion**: All else equal, simpler is better. A 0.001
+`val_bpb` improvement that adds 20 lines of hacky code is not worth it. A
+0.001 improvement from deletion is. An ~0 change with simpler code is
+also a keep.
 
-**Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome — that's a simplification win. When evaluating whether to keep a change, weigh the complexity cost against the improvement magnitude. A 0.001 val_bpb improvement that adds 20 lines of hacky code? Probably not worth it. A 0.001 val_bpb improvement from deleting code? Definitely keep. An improvement of ~0 but much simpler code? Keep.
-
-**The first run**: Your very first run should always be to establish the baseline, so you will run the training script as is.
+**The first run**: baseline. Run `train.py` unmodified. Defaults are
+`COMM=PRESETS["ndr_ib_8"]`, `OVERLAP=OVERLAP_PRESETS["ddp_typical"]`,
+`STRATEGY=dp_allreduce`. Record this as the regime baseline.
 
 ## Output format
 
-Once the script finishes it prints a summary like this:
+End-of-run summary now includes:
 
 ```
 ---
-val_bpb:          0.997900
-training_seconds: 300.1
-total_seconds:    325.9
-peak_vram_mb:     45060.2
-mfu_percent:      39.80
-total_tokens_M:   499.6
-num_steps:        953
-num_params_M:     50.3
-depth:            8
+val_bpb:                  0.997900
+training_seconds:         210.4
+total_seconds:            232.0
+peak_vram_mb:             45060.2
+mfu_percent:              39.80
+total_tokens_M:           430.1
+num_steps:                820
+num_params_M:             50.3
+depth:                    8
+strategy:                 dp_allreduce
+topology:                 ring_ar
+sim_world_size:           8
+alpha_us:                 5.000
+beta_GBs:                 50.000
+gamma_per_byte_ns:        0.000
+overlap_factor:           0.50
+overlap_window_fraction:  0.60
+overlap_hide_latency:     False
+sim_comm_seconds_raw:     180.5
+sim_comm_seconds_eff:     89.6
+overlap_hidden_frac:      50.4
+comm_fraction:            29.85
+sim_total_seconds:        300.0
 ```
 
-Note that the script is configured to always stop after 5 minutes, so depending on the computing platform of this computer the numbers might look different. You can extract the key metric from the log file:
+Extract:
 
-```
-grep "^val_bpb:" run.log
+```bash
+grep "^val_bpb:\|^comm_fraction:\|^sim_\|^strategy:\|^overlap_" run.log
 ```
 
 ## Logging results
 
-When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-separated — commas break in descriptions).
-
-The TSV has a header row and 5 columns:
+Append every run to `results.tsv` (tab-separated). Schema:
 
 ```
-commit	val_bpb	memory_gb	status	description
+commit  val_bpb  memory_gb  strategy  alpha_us  beta_GBs  P  overlap_factor  comm_frac  status  description
 ```
 
 1. git commit hash (short, 7 chars)
-2. val_bpb achieved (e.g. 1.234567) — use 0.000000 for crashes
-3. peak memory in GB, round to .1f (e.g. 12.3 — divide peak_vram_mb by 1024) — use 0.0 for crashes
-4. status: `keep`, `discard`, or `crash`
-5. short text description of what this experiment tried
+2. `val_bpb` (e.g. 0.997900) — `0.000000` for crashes
+3. peak memory in GB, `.1f` (peak_vram_mb / 1024) — `0.0` for crashes
+4. `strategy` (e.g. `dp_allreduce`)
+5. `alpha_us`
+6. `beta_GBs`
+7. world size `P`
+8. `overlap_factor`
+9. `comm_fraction` percentage as `.2f`
+10. status: `keep` / `discard` / `crash`
+11. short text description of what this experiment tried
 
 Example:
 
 ```
-commit	val_bpb	memory_gb	status	description
-a1b2c3d	0.997900	44.0	keep	baseline
-b2c3d4e	0.993200	44.2	keep	increase LR to 0.04
-c3d4e5f	1.005000	44.0	discard	switch to GeLU activation
-d4e5f6g	0.000000	0.0	crash	double model width (OOM)
+commit   val_bpb   memory_gb  strategy          alpha_us  beta_GBs  P  overlap_factor  comm_frac  status   description
+a1b2c3d  0.997900  44.0       dp_allreduce      5.000     50.000    8  0.50            29.85      keep     baseline ndr_ib_8 ddp_typical
+b2c3d4e  0.985300  44.2       dp_local_sgd      5.000     50.000    8  0.50            8.10       keep     local_steps=4
+c3d4e5f  1.001000  44.0       dp_compressed_ar  5.000     50.000    8  0.50            12.40      discard  topk-compress 0.1, val_bpb regress
+d4e5f6g  0.000000  0.0        dp_local_sgd      5.000     50.000    8  0.50            0.00       crash    local_steps=64 OOM in eval
 ```
 
 ## The experiment loop
 
-The experiment runs on a dedicated branch (e.g. `autoresearch/mar5` or `autoresearch/mar5-gpu0`).
+Run on a dedicated `commresearch/<tag>` branch.
 
 LOOP FOREVER:
 
-1. Look at the git state: the current branch/commit we're on
-2. Tune `train.py` with an experimental idea by directly hacking the code.
-3. git commit
-4. Run the experiment: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
-5. Read out the results: `grep "^val_bpb:\|^peak_vram_mb:" run.log`
-6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
-7. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
-8. If val_bpb improved (lower), you "advance" the branch, keeping the git commit
-9. If val_bpb is equal or worse, you git reset back to where you started
+1. Look at git state.
+2. Tune `train.py` (or `strategies.py` / `comm_model.py`) with one
+   experimental idea. **One variable at a time.**
+3. `git commit`
+4. `uv run train.py > run.log 2>&1`
+5. `grep "^val_bpb:\|^comm_fraction:\|^sim_\|^strategy:\|^overlap_\|^peak_vram_mb:" run.log`
+6. Empty output → crash. `tail -n 80 run.log` and try a small fix; if no
+   easy fix, log `crash` and move on.
+7. Append to `results.tsv` (do **not** commit `results.tsv`; leave
+   untracked).
+8. If `val_bpb` improved (lower) under the same declared regime, advance
+   the branch. If equal-or-worse, `git reset` to where you started.
 
-The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
+**Timeout**: ~5-min target, 10-min hard cap. Real wall-clock may be much
+shorter at high `comm_fraction`.
 
-**Timeout**: Each experiment should take ~5 minutes total (+ a few seconds for startup and eval overhead). If a run exceeds 10 minutes, kill it and treat it as a failure (discard and revert).
+**Crashes**: typo / OOM-in-eval → fix and re-run. Idea fundamentally
+broken → log `crash`, move on.
 
-**Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
+**NEVER STOP**: Do not pause to ask whether to continue once setup is done.
+The human may be asleep. Run until manually interrupted.
 
-**NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — read papers referenced in the code, re-read the in-scope files for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period.
+## Recommended phases
 
-As an example use case, a user might leave you running while they sleep. If each experiment takes you ~5 minutes then you can run approx 12/hour, for a total of about 100 over the duration of the average human sleep. The user then wakes up to experimental results, all completed by you while they slept!
+Use the regime baseline (Phase 0) as the reference for every later
+keep/discard decision *within the same regime*.
+
+### Phase 0 — Regime baseline (1 run)
+Default config. Captures `val_bpb`, `comm_fraction`, `sim_*` for
+`ndr_ib_8 + ddp_typical + dp_allreduce`.
+
+### Phase 1 — Strategy sweep at the baseline regime (4–6 runs)
+- `dp_local_sgd` with `local_steps ∈ {4, 16, 64}`
+- `dp_compressed_ar` with `compression_ratio ∈ {0.5, 0.1, 0.01}`
+- Each gets one row in `results.tsv` per setting.
+
+### Phase 2 — Overlap sweep (3 runs)
+Pin the Phase-1 winner. Sweep
+`OverlapModel.factor ∈ {0.0, 0.5, 0.85, 1.0}` (factor=0.5 is the Phase 1
+baseline overlap). Records the method's overlap-sensitivity.
+
+### Phase 3 — α–β regime sweep (4–6 runs)
+Pin Phase-2 winner. Vary `COMM` across `PRESETS`:
+`spark_200gbe_2`, `gbe_8`, `nvlink_8`. Plus a "double β" point
+(simulate 2× worse bandwidth). Goal: an operating envelope per method.
+
+### Phase 4 — s-step / NS variants (open-ended)
+Polynomial-basis Muon NS, randomized sketched orthogonalization, etc.
+Held under the Phase-2 winning regime; declare the regime in the
+description. See `CLAUDE.md` "Use case: s-step methods research" for
+candidates.
+
+### Phase 5 — Reinvestment (1–2 runs)
+Take the cheapest winner that matches Phase-0 `val_bpb` and feed the
+freed simulated-time budget back into more steps. This is the
+communication-avoidance payoff in a single number.
+
+## Stop conditions
+
+- Per-experiment: 10-min real-wall-clock hard cap (already in `train.py`).
+- Per-phase: 3 consecutive variants regress `val_bpb` by ≥ 0.005 → abort
+  phase, move on.
+- Whole study: declared done when Phase 5 yields a meaningful
+  reinvestment win, OR ~30 runs in with no winner (a real negative
+  result — record it).

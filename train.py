@@ -24,6 +24,8 @@ repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/fl
 fa3 = get_kernel(repo).flash_attn_interface
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
+from comm_model import CommModel, OverlapModel, Topology, apply_overlap, PRESETS, OVERLAP_PRESETS
+from strategies import StrategyConfig, step_cost
 
 # ---------------------------------------------------------------------------
 # GPT Model
@@ -451,6 +453,29 @@ DEPTH = 8               # number of transformer layers
 DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
 # ---------------------------------------------------------------------------
+# Communication model (the pivot from autoresearch).
+#
+# The 5-min TIME_BUDGET is reinterpreted as *simulated* wall-clock that
+# includes modeled communication. Real GPU compute happens at full speed,
+# but each step's modeled comm cost (after overlap) is added to the budget
+# counter. Methods that reduce comm fit more steps in the same simulated
+# budget and therefore lower val_bpb.
+#
+# This is a model, not a real fabric. It rank-orders methods consistently
+# across regimes; absolute numbers won't match any specific cluster.
+# ---------------------------------------------------------------------------
+
+COMM = PRESETS["ndr_ib_8"]                          # sweep alpha, beta, P
+OVERLAP = OVERLAP_PRESETS["ddp_typical"]            # sweep factor, window
+STRATEGY = StrategyConfig(
+    name="dp_allreduce",
+    topology=Topology.RING_AR,
+    bytes_per_param=2,                              # bf16 grads
+    local_steps=1,                                  # for dp_local_sgd
+    compression_ratio=1.0,                          # for dp_compressed_ar
+)
+
+# ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
 # ---------------------------------------------------------------------------
 
@@ -538,7 +563,15 @@ def get_weight_decay(progress):
 t_start_training = time.time()
 smooth_train_loss = 0
 total_training_time = 0
+simulated_comm_time = 0.0           # cumulative on-critical-path comm
+simulated_comm_raw = 0.0            # cumulative raw comm (pre-overlap)
+last_step_comm_eff = 0.0
+last_step_comm_raw = 0.0
 step = 0
+
+print(f"comm: alpha={COMM.alpha:.2e}s beta={COMM.beta:.2e}s/B gamma={COMM.gamma:.2e}s/B P={COMM.P}")
+print(f"strategy: {STRATEGY.name} topology={STRATEGY.topology.value}")
+print(f"overlap: factor={OVERLAP.factor} window_fraction={OVERLAP.window_fraction} hide_lat={OVERLAP.hide_latency}")
 
 while True:
     torch.cuda.synchronize()
@@ -551,8 +584,8 @@ while True:
         loss.backward()
         x, y, epoch = next(train_loader)
 
-    # Progress and schedules
-    progress = min(total_training_time / TIME_BUDGET, 1.0)
+    # Progress and schedules — driven by *simulated* time (compute + modeled comm)
+    progress = min((total_training_time + simulated_comm_time) / TIME_BUDGET, 1.0)
     lrm = get_lr_multiplier(progress)
     muon_momentum = get_muon_momentum(step)
     muon_weight_decay = get_weight_decay(progress)
@@ -575,8 +608,18 @@ while True:
     t1 = time.time()
     dt = t1 - t0
 
+    # Modeled communication for this step. Compute window for overlap is
+    # taken as the measured per-step compute time dt (the strategy's
+    # window_fraction further scales this).
+    sc = step_cost(STRATEGY, COMM, num_params, step)
+    last_step_comm_raw = sc.t_comm_total
+    last_step_comm_eff = apply_overlap(
+        sc.t_comm_total, sc.t_comm_latency, dt, OVERLAP)
+
     if step > 10:
         total_training_time += dt
+        simulated_comm_raw += last_step_comm_raw
+        simulated_comm_time += last_step_comm_eff
 
     # Logging
     ema_beta = 0.9
@@ -585,9 +628,11 @@ while True:
     pct_done = 100 * progress
     tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
     mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
-    remaining = max(0, TIME_BUDGET - total_training_time)
+    remaining = max(0, TIME_BUDGET - (total_training_time + simulated_comm_time))
+    comm_frac = (simulated_comm_time /
+                 max(1e-9, total_training_time + simulated_comm_time))
 
-    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
+    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | comm: {last_step_comm_eff*1000:.1f}ms (raw {last_step_comm_raw*1000:.1f}) | comm_frac: {comm_frac*100:.1f}% | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | remaining: {remaining:.0f}s    ", end="", flush=True)
 
     # GC management (Python's GC causes ~500ms stalls)
     if step == 0:
@@ -599,8 +644,13 @@ while True:
 
     step += 1
 
-    # Time's up — but only stop after warmup steps so we don't count compilation
-    if step > 10 and total_training_time >= TIME_BUDGET:
+    # Time's up — simulated wall-clock (compute + modeled comm). Skip
+    # warmup steps so we don't count compilation.
+    if step > 10 and (total_training_time + simulated_comm_time) >= TIME_BUDGET:
+        break
+    # Real-wall-clock kill switch (program.md hard limit).
+    if (time.time() - t_start) > 600:
+        print("\nREAL-WALL-CLOCK KILL: 10min exceeded")
         break
 
 print()  # newline after \r training log
@@ -618,13 +668,32 @@ startup_time = t_start_training - t_start
 steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
 peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
 
+simulated_total = total_training_time + simulated_comm_time
+comm_fraction = simulated_comm_time / max(1e-9, simulated_total)
+overlap_savings = simulated_comm_raw - simulated_comm_time
+overlap_hidden_frac = overlap_savings / max(1e-9, simulated_comm_raw)
+
 print("---")
-print(f"val_bpb:          {val_bpb:.6f}")
-print(f"training_seconds: {total_training_time:.1f}")
-print(f"total_seconds:    {t_end - t_start:.1f}")
-print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
-print(f"mfu_percent:      {steady_state_mfu:.2f}")
-print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
-print(f"num_steps:        {step}")
-print(f"num_params_M:     {num_params / 1e6:.1f}")
-print(f"depth:            {DEPTH}")
+print(f"val_bpb:                  {val_bpb:.6f}")
+print(f"training_seconds:         {total_training_time:.1f}")
+print(f"total_seconds:            {t_end - t_start:.1f}")
+print(f"peak_vram_mb:             {peak_vram_mb:.1f}")
+print(f"mfu_percent:              {steady_state_mfu:.2f}")
+print(f"total_tokens_M:           {total_tokens / 1e6:.1f}")
+print(f"num_steps:                {step}")
+print(f"num_params_M:             {num_params / 1e6:.1f}")
+print(f"depth:                    {DEPTH}")
+print(f"strategy:                 {STRATEGY.name}")
+print(f"topology:                 {STRATEGY.topology.value}")
+print(f"sim_world_size:           {COMM.P}")
+print(f"alpha_us:                 {COMM.alpha * 1e6:.3f}")
+print(f"beta_GBs:                 {(1.0 / COMM.beta) / 1e9 if COMM.beta > 0 else float('inf'):.3f}")
+print(f"gamma_per_byte_ns:        {COMM.gamma * 1e9:.3f}")
+print(f"overlap_factor:           {OVERLAP.factor:.2f}")
+print(f"overlap_window_fraction:  {OVERLAP.window_fraction:.2f}")
+print(f"overlap_hide_latency:     {OVERLAP.hide_latency}")
+print(f"sim_comm_seconds_raw:     {simulated_comm_raw:.2f}")
+print(f"sim_comm_seconds_eff:     {simulated_comm_time:.2f}")
+print(f"overlap_hidden_frac:      {overlap_hidden_frac * 100:.1f}")
+print(f"comm_fraction:            {comm_fraction * 100:.2f}")
+print(f"sim_total_seconds:        {simulated_total:.1f}")
